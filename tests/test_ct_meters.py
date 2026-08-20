@@ -1,5 +1,6 @@
 """Test envoy metered with enabled and disabled CT"""
 
+import copy
 import logging
 from typing import Any
 
@@ -12,6 +13,7 @@ from syrupy.assertion import SnapshotAssertion
 from pyenphase import register_updater
 from pyenphase.const import (
     PHASENAMES,
+    PhaseNames,
     SupportedFeatures,
 )
 from pyenphase.envoy import UPDATERS
@@ -23,7 +25,10 @@ from pyenphase.models.meters import (
 )
 from pyenphase.models.system_consumption import EnvoySystemConsumption
 from pyenphase.models.system_production import EnvoySystemProduction
-from pyenphase.updaters.meters import EnvoyMetersUpdater
+from pyenphase.updaters.meters import (
+    EnvoyMetersUpdater,
+    _find_zero_phase_for_storage_anomaly,
+)
 
 from .common import (
     get_mock_envoy,
@@ -567,9 +572,10 @@ async def test_yet_unknown_ct_with_8_2_127_with_3cts_and_battery_split(
 
     # verify yet unknown type is now in ct list and has data with this label
     assert yet_unknown_ct_type in envoy.ct_meter_list
-    assert data.ctmeters[yet_unknown_ct_type]
-    assert data.ctmeters[yet_unknown_ct_type].state == meter["state"]
-    assert data.ctmeters[yet_unknown_ct_type].eid == meter["eid"]
+    yet_unknown_ct = data.ctmeters[yet_unknown_ct_type]
+    assert yet_unknown_ct
+    assert yet_unknown_ct.state == meter["state"]
+    assert yet_unknown_ct.eid == meter["eid"]
     assert envoy.meter_type(yet_unknown_ct_type) == yet_unknown_ct_type
 
     # last one in original list was storage ct. Should not be there anymore
@@ -805,8 +811,6 @@ async def test_current_transformers(
     assert has_meter == meter_type_present
     assert has_meter == meter_in_model
 
-    # end backward compatibility test
-
     # verify meter data
     meter_json = await load_json_fixture(version, "ivp_meters")
     meter_data_json = await load_json_fixture(version, "ivp_meters_readings")
@@ -825,6 +829,7 @@ async def test_current_transformers(
         meter_data = meters_data[0]
         cttype = meter["measurementType"]
         ctdata = data.ctmeters[cttype]
+        assert ctdata
         assert ctdata.energy_delivered == round(meter_data["actEnergyDlvd"])
         assert ctdata.energy_received == round(meter_data["actEnergyRcvd"])
         assert ctdata.active_power == round(meter_data["activePower"])
@@ -862,6 +867,7 @@ async def test_current_transformers(
             )[i]
             assert data.ctmeters_phases[cttype].get(PHASENAMES[i]) is not None
             ctdata_phase = data.ctmeters_phases[cttype][PHASENAMES[i]]
+            assert ctdata_phase
             assert ctdata_phase.energy_delivered == round(phase_data["actEnergyDlvd"])
             assert ctdata_phase.energy_received == round(phase_data["actEnergyRcvd"])
             assert ctdata_phase.active_power == round(phase_data["activePower"])
@@ -1562,3 +1568,381 @@ async def test_intermittent_activeCount_without_production_ct(
     assert data.system_production.watt_hours_today == 5113
     assert data.system_production.watt_hours_last_7_days == 69492
     assert data.system_production.watt_hours_lifetime == 4351113
+
+
+@pytest.mark.parametrize(
+    (
+        "version",  # firmware version pyenphase gets passed
+        "aggregate_data",  # aggregate storage CT values to expect for active_power, energy_received and energy_delivered
+        "phase_l1_data",  # L1 phase storage CT values to expect
+        "phase_l2_data",  # L2 phase storage CT values to expect
+        "block_zero",  # firmware will detect zero values and return None for aggregate and phase
+    ),
+    [
+        (
+            "8.3.6087_storage_ct_drops",
+            {
+                "active_power": 0,
+                "energy_received": 2425361,
+                "energy_delivered": 343300,
+            },
+            {
+                "active_power": 0,
+                "energy_received": 1212681,
+                "energy_delivered": 171650,
+            },
+            {
+                "active_power": 0,
+                "energy_received": 1212681,
+                "energy_delivered": 171650,
+            },
+            True,
+        ),
+        (
+            "8.2.4286_with_3cts_and_battery_split",
+            {
+                "active_power": -7084,
+                "energy_received": 5409935,
+                "energy_delivered": 4073871,
+            },
+            {
+                "active_power": -3538,
+                "energy_received": 2703734,
+                "energy_delivered": 2036140,
+            },
+            {
+                "active_power": -3545,
+                "energy_received": 2706201,
+                "energy_delivered": 2037731,
+            },
+            False,
+        ),
+    ],
+    ids=[
+        "8.3.6087",
+        "8.2.4286",
+    ],
+)
+@pytest.mark.asyncio
+async def test_intermittent_zero_storageCT_Phase_asof_8_3_6087(
+    mock_aioresponse: aioresponses,
+    test_client_session: aiohttp.ClientSession,
+    version: str,
+    aggregate_data: dict[str, Any],
+    phase_l1_data: dict[str, Any],
+    phase_l2_data: dict[str, Any],
+    block_zero: bool,
+) -> None:
+    """
+    Test envoy metered with storage ct and intermitted 1 phase zero values.
+
+    Envoy firmware D8.3.6087, /ivp/meters/readings for split, 2 phase storage CT
+    intermittently reports zero values on one phase. Aggregated data then
+    drops to the other phase values resulting in incorrect storage data.
+    Test meters updates return None in the storage CT and storage CT L1 Phase data
+    if this scenario applies.
+    """
+    start_7_firmware_mock(mock_aioresponse)
+    await prep_envoy(mock_aioresponse, "127.0.0.1", version)
+
+    envoy = await get_mock_envoy(test_client_session)
+    data = envoy.data
+    assert data is not None
+    assert envoy._supported_features is not None
+
+    # Verify storage CT data is present
+    assert envoy._supported_features & SupportedFeatures.CTMETERS
+    assert envoy.meter_type(CtType.STORAGE) == CtType.STORAGE
+    assert data.ctmeters is not None
+    assert (agg_data := data.ctmeters[CtType.STORAGE]) is not None
+    assert data.ctmeters_phases is not None
+
+    # Test without phase data zero issue
+    assert agg_data.active_power == aggregate_data["active_power"]
+    assert agg_data.energy_received == aggregate_data["energy_received"]
+    assert agg_data.energy_delivered == aggregate_data["energy_delivered"]
+    assert (
+        l1_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    ) is not None
+    assert l1_data.active_power == phase_l1_data["active_power"]
+    assert l1_data.energy_received == phase_l1_data["energy_received"]
+    assert l1_data.energy_delivered == phase_l1_data["energy_delivered"]
+    assert (
+        l2_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2]
+    ) is not None
+    assert l2_data.active_power == phase_l2_data["active_power"]
+    assert l2_data.energy_received == phase_l2_data["energy_received"]
+    assert l2_data.energy_delivered == phase_l2_data["energy_delivered"]
+
+    # start backward compatibility test
+    assert data.ctmeter_storage is data.ctmeters[CtType.STORAGE]
+    assert data.ctmeter_storage_phases is data.ctmeters_phases[CtType.STORAGE]
+    # end backward compatibility test
+
+    # Test storagect intermittent one phase zero anomaly detection function
+    # operational data without zero phase, should return None
+    assert data is not None
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+
+    # no aggregate data for storage, should get None
+    save_agg_data = copy.deepcopy(data.ctmeters[CtType.STORAGE])
+    data.ctmeters[CtType.STORAGE] = None
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+    data.ctmeters[CtType.STORAGE] = save_agg_data
+
+    # no phase data for storage, should get None
+    phase_data = copy.deepcopy(data.ctmeters_phases[CtType.STORAGE])
+    del data.ctmeters_phases[CtType.STORAGE]
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+    data.ctmeters_phases[CtType.STORAGE] = phase_data
+
+    # only phase 1 to none, should get None
+    phase1_data = copy.deepcopy(
+        data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    )
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1] = None
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1] = phase1_data
+
+    # only phase 2 to none, should get None
+    phase2_data = copy.deepcopy(
+        data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2]
+    )
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2] = None
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2] = phase2_data
+
+    # one phase zero but aggregate is not equal to non-zero phase, should get None
+    assert data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2] is not None
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2].active_power = 0  # type: ignore[union-attr]
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2].energy_delivered = 0  # type: ignore[union-attr]
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2].energy_received = 0  # type: ignore[union-attr]
+
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+
+    # set aggregate data equal to non-zero phase, should get zero phase 2 reported
+    p1_data = data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    data.ctmeters[CtType.STORAGE].active_power = p1_data.active_power  # type: ignore[union-attr]
+    data.ctmeters[CtType.STORAGE].energy_delivered = p1_data.energy_delivered  # type: ignore[union-attr]
+    data.ctmeters[CtType.STORAGE].energy_received = p1_data.energy_received  # type: ignore[union-attr]
+
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result == PhaseNames.PHASE_2
+
+    # both phases to zero, but aggregate not, should get None
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1].active_power = 0  # type: ignore[union-attr]
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1].energy_delivered = 0  # type: ignore[union-attr]
+    data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1].energy_received = 0  # type: ignore[union-attr]
+
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+
+    # both phases and aggregate to zero,all zero, should get None
+    data.ctmeters[CtType.STORAGE].active_power = 0  # type: ignore[union-attr]
+    data.ctmeters[CtType.STORAGE].energy_delivered = 0  # type: ignore[union-attr]
+    data.ctmeters[CtType.STORAGE].energy_received = 0  # type: ignore[union-attr]
+
+    result = _find_zero_phase_for_storage_anomaly(data)
+    assert result is None
+
+    # For D8.3.6087, /ivp/meters/readings started intermittently reporting incorrect storage
+    # CT lifetime energy values on split-phase system.  One storage channel reports all
+    # zeros and the aggregate value becomes equal to the remaining non-zero channel.
+
+    # test with zero l1 channel and aggregate equal to L2 data
+    # for D8.3.6087 and newer, should have None for aggregate and L1.
+    # For older fw aggregate has L2 values and L1 zeros.
+
+    meter_data_json = await load_json_list_fixture(version, "ivp_meters_readings")
+    items = [
+        item
+        for item in meter_data_json[2]["channels"][1]
+        if item not in ("eid", "timestamp")
+    ]
+    for item in items:
+        # patch 3th entry which is the storage CT, first phase value to zero
+        meter_data_json[2]["channels"][0][item] = 0
+        # patch aggregate values of storage CT to second phase values
+        meter_data_json[2][item] = meter_data_json[2]["channels"][1][item]
+
+    override_mock(
+        mock_aioresponse,
+        "get",
+        "https://127.0.0.1/ivp/meters/readings",
+        status=200,
+        payload=meter_data_json,
+        repeat=True,
+    )
+    await envoy.update()
+    data = envoy.data
+
+    # block_zero true is signal to expect Aggregate and L1 data not be reported
+    # L2 regular if applicable.
+    # If False expect zero in L1 and Aggretae == L2
+    assert data
+    assert data.ctmeters is not None
+    assert data.ctmeters_phases is not None
+    # Storage data should have been set to None if fw is eligible for correction
+    assert (data.ctmeters[CtType.STORAGE] is None) == block_zero
+    # Storage CT L1 phase should have been set to None if fw is eligible for correction
+    # otherwise l1 phase data should have zeros set in the test
+    zeroed_l1 = data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    assert (zeroed_l1 is None) == block_zero
+    if not block_zero:
+        assert zeroed_l1 is not None
+        assert zeroed_l1.active_power == 0
+        assert zeroed_l1.energy_delivered == 0
+        assert zeroed_l1.energy_received == 0
+
+    # In this test Storage CT L2 data should be returned as usual
+    assert (
+        l2_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2]
+    ) is not None
+    assert l2_data.active_power == phase_l2_data["active_power"]
+    assert l2_data.energy_received == phase_l2_data["energy_received"]
+    assert l2_data.energy_delivered == phase_l2_data["energy_delivered"]
+
+    # start backward compatibility test
+    assert data.ctmeter_storage is data.ctmeters[CtType.STORAGE]
+    assert data.ctmeter_storage_phases is data.ctmeters_phases[CtType.STORAGE]
+    # end backward compatibility test
+
+    # same test for other phase being 0
+    meter_data_json = await load_json_list_fixture(version, "ivp_meters_readings")
+    items = [
+        item
+        for item in meter_data_json[2]["channels"][1]
+        if item not in ("eid", "timestamp")
+    ]
+    for item in items:
+        # patch 3th entry which is the storage CT, second phase value to zero
+        meter_data_json[2]["channels"][1][item] = 0
+        # patch aggregate values of storage CT to second phase values
+        meter_data_json[2][item] = meter_data_json[2]["channels"][0][item]
+
+    override_mock(
+        mock_aioresponse,
+        "get",
+        "https://127.0.0.1/ivp/meters/readings",
+        status=200,
+        payload=meter_data_json,
+        repeat=True,
+    )
+    await envoy.update()
+    data = envoy.data
+
+    # Aggregate and L2 data should be None, L1 regular if applicable
+    assert data
+    assert data.ctmeters is not None
+    # Storage data should have been set to None if fw is eligible for correction
+    assert (data.ctmeters[CtType.STORAGE] is None) == block_zero
+
+    # In this test Storage CT L1 data should be returned as usual
+    assert data.ctmeters_phases is not None
+    assert (
+        l1_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    ) is not None
+    assert l1_data.active_power == phase_l1_data["active_power"]
+    assert l1_data.energy_received == phase_l1_data["energy_received"]
+    assert l1_data.energy_delivered == phase_l1_data["energy_delivered"]
+
+    # Storage CT L2 phase should have been set to None if fw is eligible for correction
+    # otherwise l2 phase data should show zeros set in the test
+    zeroed_l2 = data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2]
+    assert (zeroed_l2 is None) == block_zero
+    if not block_zero:
+        assert zeroed_l2 is not None
+        assert zeroed_l2.active_power == 0
+        assert zeroed_l2.energy_received == 0
+        assert zeroed_l2.energy_delivered == 0
+
+    # start backward compatibility test
+    assert data.ctmeter_storage is data.ctmeters[CtType.STORAGE]
+    assert data.ctmeter_storage_phases is data.ctmeters_phases[CtType.STORAGE]
+    # end backward compatibility test
+
+    # Test with issue at probe time
+    envoy = await get_mock_envoy(test_client_session)
+    data = envoy.data
+
+    # Verify storage CT data is present
+    assert envoy._supported_features is not None
+    assert envoy._supported_features & SupportedFeatures.CTMETERS
+    assert envoy.meter_type(CtType.STORAGE) == CtType.STORAGE
+
+    # Aggregate and L2 data should be None, L1 regular if applicable
+    assert data
+    assert data.ctmeters is not None
+    # Storage data should have been set to None if fw is eligible for correction
+    assert (data.ctmeters[CtType.STORAGE] is None) == block_zero
+
+    # In this test Storage CT L1 data should be returned as usual
+    assert data.ctmeters_phases is not None
+    assert (
+        l1_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    ) is not None
+    assert l1_data.active_power == phase_l1_data["active_power"]
+    assert l1_data.energy_received == phase_l1_data["energy_received"]
+    assert l1_data.energy_delivered == phase_l1_data["energy_delivered"]
+
+    # Storage CT L2 phase should have been set to None if fw is eligible for correction
+    # otherwise l2 phase data should show zeros set in the test
+    zeroed_l2 = data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2]
+    assert (zeroed_l2 is None) == block_zero
+    if not block_zero:
+        assert zeroed_l2 is not None
+        assert zeroed_l2.active_power == 0
+        assert zeroed_l2.energy_received == 0
+        assert zeroed_l2.energy_delivered == 0
+
+    # start backward compatibility test
+    assert data.ctmeter_storage is data.ctmeters[CtType.STORAGE]
+    assert data.ctmeter_storage_phases is data.ctmeters_phases[CtType.STORAGE]
+    # end backward compatibility test
+
+    # restore zero L2 and aggregate to original values
+    meter_data_json = await load_json_list_fixture(version, "ivp_meters_readings")
+    override_mock(
+        mock_aioresponse,
+        "get",
+        "https://127.0.0.1/ivp/meters/readings",
+        status=200,
+        payload=meter_data_json,
+        repeat=True,
+    )
+    await envoy.update()
+    data = envoy.data
+
+    assert data is not None
+    assert data.ctmeters is not None
+    assert (agg_data := data.ctmeters[CtType.STORAGE]) is not None
+    assert agg_data is not None
+    assert data.ctmeters_phases is not None
+
+    # All data should be available again
+    assert agg_data.active_power == aggregate_data["active_power"]
+    assert agg_data.energy_received == aggregate_data["energy_received"]
+    assert agg_data.energy_delivered == aggregate_data["energy_delivered"]
+    assert (
+        l1_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_1]
+    ) is not None
+    assert l1_data.active_power == phase_l1_data["active_power"]
+    assert l1_data.energy_received == phase_l1_data["energy_received"]
+    assert l1_data.energy_delivered == phase_l1_data["energy_delivered"]
+    assert (
+        l2_data := data.ctmeters_phases[CtType.STORAGE][PhaseNames.PHASE_2]
+    ) is not None
+    assert l2_data.active_power == phase_l2_data["active_power"]
+    assert l2_data.energy_received == phase_l2_data["energy_received"]
+    assert l2_data.energy_delivered == phase_l2_data["energy_delivered"]
+
+    # start backward compatibility test
+    assert data.ctmeter_storage is data.ctmeters[CtType.STORAGE]
+    assert data.ctmeter_storage_phases is data.ctmeters_phases[CtType.STORAGE]
+    # end backward compatibility test
