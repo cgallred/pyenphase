@@ -1,6 +1,15 @@
 # CHANGELOG
 
 
+## v4.0.0 (2026-08-20)
+
+### Bug Fixes
+
+- 8.3.6087 intermittent storage CT zero phase data and aggregate value drop
+  ([#481](https://github.com/pyenphase/pyenphase/pull/481),
+  [`3fca997`](https://github.com/pyenphase/pyenphase/commit/3fca997ef09485e4b5f94e7777ad6dbbea6991fc))
+
+
 ## v3.2.3 (2026-08-19)
 
 ### Bug Fixes
