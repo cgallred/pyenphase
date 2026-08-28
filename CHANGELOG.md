@@ -1,6 +1,36 @@
 # CHANGELOG
 
 
+## v4.0.1 (2026-08-28)
+
+### Bug Fixes
+
+- KeyError 'exercise_config' in generator schedule
+  ([#489](https://github.com/pyenphase/pyenphase/pull/489),
+  [`e6cf9d9`](https://github.com/pyenphase/pyenphase/commit/e6cf9d96b068ebf859a058601a2fb3ee7ddac894))
+
+### Chores
+
+- **deps**: Bump lxml from 6.1.1 to 6.1.2 ([#487](https://github.com/pyenphase/pyenphase/pull/487),
+  [`f04879b`](https://github.com/pyenphase/pyenphase/commit/f04879b5cec252090f30890f775d14df7519eb4b))
+
+- **deps**: Bump orjson from 3.11.9 to 3.12.0
+  ([#486](https://github.com/pyenphase/pyenphase/pull/486),
+  [`7f3a157`](https://github.com/pyenphase/pyenphase/commit/7f3a1570ee38550c23ca1e8d8c4cfeefcca2f470))
+
+- **pre-commit.ci**: Pre-commit autoupdate ([#488](https://github.com/pyenphase/pyenphase/pull/488),
+  [`f1e136a`](https://github.com/pyenphase/pyenphase/commit/f1e136a60f49cf5cc322cf12f0ec3da09c43dab4))
+
+### Continuous Integration
+
+- Nail gitpython to 3.1.59 for now to fix semantic release problem
+  ([#490](https://github.com/pyenphase/pyenphase/pull/490),
+  [`29a203e`](https://github.com/pyenphase/pyenphase/commit/29a203ed26cf3141c390acf71c5374a678e098cb))
+
+- Revert fixing gitpython version ([#491](https://github.com/pyenphase/pyenphase/pull/491),
+  [`e62980b`](https://github.com/pyenphase/pyenphase/commit/e62980b7114a72afc1784cedfcf8d2bb1154d043))
+
+
 ## v4.0.0 (2026-08-20)
 
 ### Bug Fixes
